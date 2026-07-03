@@ -9,10 +9,11 @@ los métodos retornan valores seguros en lugar de propagar excepciones,
 permitiendo que el Edge API opere en modo offline.
 
 Endpoints del Web Service utilizados:
-  GET  /api/v1/device/edge/{edgeMac}/iot/{iotMac}/threshold
+  GET  /api/v1/edges/{edgeMac}/iot-devices/{iotMac}/thresholds
          — Obtiene el umbral agronómico configurado para el par edge/iot.
          — Respuesta: { "edgeMac", "iotMac", "min", "max", "description", "type" }
-  POST /api/v1/device/edge/{edgeMac}/digest
+         — 404 si aún no hay umbral configurado para ese par.
+  POST /api/v1/edges/{edgeMac}/sensor-readings
          — Envía el lote de lecturas en formato ReadDeviceSensorsDataResource.
          — Respuesta: 200 OK (sin cuerpo).
 
@@ -52,11 +53,14 @@ from telemetry.domain.model import AgronomicThreshold, TelemetryRecord
 
 logger = logging.getLogger(__name__)
 
-_BASE_URL = os.getenv("CLOUD_BASE_URL", "http://localhost:5000")
-_EDGE_MAC = os.getenv("EDGE_MAC", "")
-_IOT_MAC  = os.getenv("IOT_MAC", "")
-_API_KEY  = os.getenv("CLOUD_API_KEY", "")
-_TIMEOUT  = int(os.getenv("CLOUD_TIMEOUT", "5"))
+_BASE_URL       = os.getenv("CLOUD_BASE_URL", "http://localhost:5000")
+_EDGE_MAC       = os.getenv("EDGE_MAC", "")
+_IOT_MAC        = os.getenv("IOT_MAC", "")
+_API_KEY        = os.getenv("CLOUD_API_KEY", "")
+_TIMEOUT        = int(os.getenv("CLOUD_TIMEOUT", "5"))
+_ZONE_ID        = int(os.getenv("MONITORING_ZONE_ID", "1"))
+_ADMIN_USERNAME = os.getenv("CLOUD_ADMIN_USERNAME", "admin")
+_ADMIN_PASSWORD = os.getenv("CLOUD_ADMIN_PASSWORD", "admin")
 
 # ─── Mapeo bidireccional entre nombres de variable del Edge API ─────────────
 # y SensorType del Web Service.
@@ -133,8 +137,8 @@ class CloudApiClient:
             return []
 
         url = (
-            f"{_BASE_URL}/api/v1/device/edge/{_EDGE_MAC}"
-            f"/iot/{_IOT_MAC}/threshold"
+            f"{_BASE_URL}/api/v1/edges/{_EDGE_MAC}"
+            f"/iot-devices/{_IOT_MAC}/thresholds"
         )
         try:
             response = requests.get(
@@ -184,11 +188,19 @@ class CloudApiClient:
                 _TIMEOUT,
             )
         except requests.exceptions.HTTPError as exc:
-            logger.warning(
-                "Error HTTP %s al obtener umbrales del cloud: %s.",
-                exc.response.status_code,
-                exc,
-            )
+            if exc.response.status_code == 404:
+                # 404 es estado normal: aún no hay umbral configurado en el backend.
+                logger.info(
+                    "Sin umbral configurado en el cloud para edge=%s iot=%s (404).",
+                    _EDGE_MAC,
+                    _IOT_MAC,
+                )
+            else:
+                logger.warning(
+                    "Error HTTP %s al obtener umbrales del cloud: %s.",
+                    exc.response.status_code,
+                    exc,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Error inesperado al obtener umbrales del cloud: %s.", exc)
 
@@ -218,7 +230,7 @@ class CloudApiClient:
             logger.debug("EDGE_MAC no configurado — reenvío al cloud omitido.")
             return False
 
-        url = f"{_BASE_URL}/api/v1/device/edge/{_EDGE_MAC}/digest"
+        url = f"{_BASE_URL}/api/v1/edges/{_EDGE_MAC}/sensor-readings"
         timestamp = record.recorded_at.isoformat()
 
         payload = {
@@ -270,5 +282,168 @@ class CloudApiClient:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Error inesperado al reenviar lote al cloud: %s.", exc)
+
+        return False
+
+    @staticmethod
+    def fetch_registry() -> list[str]:
+        """
+        Obtiene la lista de IoT Devices autorizados para este Edge desde el Cloud.
+
+        Hace GET a /api/v1/edges/{edgeMac}/registry y extrae los iotDeviceMac
+        del campo `registry`. Si el Cloud no responde o el Edge no está aún
+        registrado (404), retorna lista vacía y el IAM local usará lo que ya
+        tenga en SQLite de sincronizaciones anteriores.
+
+        Returns:
+            Lista de MAC address strings de los IoT Devices autorizados,
+            o lista vacía si el Cloud no está disponible.
+        """
+        if not _EDGE_MAC:
+            logger.debug("EDGE_MAC no configurado — fetch de registry omitido.")
+            return []
+
+        url = f"{_BASE_URL}/api/v1/edges/{_EDGE_MAC}/registry"
+        try:
+            response = requests.get(
+                url,
+                headers=CloudApiClient._headers(),
+                timeout=_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+            mac_list = [entry["iotDeviceMac"] for entry in data.get("registry", [])]
+            logger.info(
+                "Registry obtenido del cloud: %d IoT device(s) autorizados.", len(mac_list)
+            )
+            return mac_list
+
+        except requests.exceptions.ConnectionError:
+            logger.warning("Cloud no disponible al obtener registry (ConnectionError).")
+        except requests.exceptions.Timeout:
+            logger.warning("Timeout al obtener registry del cloud (>%ds).", _TIMEOUT)
+        except requests.exceptions.HTTPError as exc:
+            if exc.response.status_code == 404:
+                logger.info(
+                    "Edge Device '%s' aún no registrado en el cloud — registry vacío (404).",
+                    _EDGE_MAC,
+                )
+            else:
+                logger.warning(
+                    "Error HTTP %s al obtener registry: %s.", exc.response.status_code, exc
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Error inesperado al obtener registry del cloud: %s.", exc)
+
+        return []
+
+    @staticmethod
+    def register_edge_device() -> bool:
+        """
+        Registra el Edge Device en el Cloud si aún no existe.
+
+        Hace POST a /api/v1/edges con la MAC y monitoringZoneId configurados.
+        Un 409 Conflict indica que el device ya estaba registrado — se trata
+        como éxito para que el bootstrap sea idempotente en reinicios.
+
+        Returns:
+            True si el dispositivo quedó registrado (201) o ya existía (409).
+            False si ocurrió un error de red o de autenticación.
+        """
+        if not _EDGE_MAC:
+            logger.warning("EDGE_MAC no configurado — registro del Edge Device omitido.")
+            return False
+
+        url = f"{_BASE_URL}/api/v1/edges"
+        payload = {
+            "edgeMac":          _EDGE_MAC,
+            "monitoringZoneId": _ZONE_ID,
+            "username":         _ADMIN_USERNAME,
+            "password":         _ADMIN_PASSWORD,
+        }
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers=CloudApiClient._headers(),
+                timeout=_TIMEOUT,
+            )
+            if response.status_code == 409:
+                logger.info("Edge Device '%s' ya estaba registrado en el cloud (409).", _EDGE_MAC)
+                return True
+            response.raise_for_status()
+            logger.info("Edge Device '%s' registrado en el cloud (201).", _EDGE_MAC)
+            return True
+
+        except requests.exceptions.ConnectionError:
+            logger.warning("Cloud no disponible al registrar Edge Device (ConnectionError).")
+        except requests.exceptions.Timeout:
+            logger.warning("Timeout al registrar Edge Device en el cloud (>%ds).", _TIMEOUT)
+        except requests.exceptions.HTTPError as exc:
+            logger.warning(
+                "Error HTTP %s al registrar Edge Device: %s.", exc.response.status_code, exc
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Error inesperado al registrar Edge Device: %s.", exc)
+
+        return False
+
+    @staticmethod
+    def register_iot_device() -> bool:
+        """
+        Registra el IoT Device en el Cloud asociándolo al Edge Device.
+
+        Hace POST a /api/v1/edges/{edgeMac}/iot-devices con la MAC del D1.
+        Requiere que el Edge Device ya esté registrado. Un 409 indica que
+        el IoT Device ya existía — se trata como éxito (idempotente).
+        El backend publica IotDeviceRegisteredEvent al registrar por primera
+        vez, lo que siembra los umbrales agronómicos por defecto.
+
+        Returns:
+            True si el dispositivo quedó registrado (201) o ya existía (409).
+            False si ocurrió un error de red, autenticación o el Edge no existe.
+        """
+        if not _EDGE_MAC or not _IOT_MAC:
+            logger.warning(
+                "EDGE_MAC o IOT_MAC no configurados — registro del IoT Device omitido."
+            )
+            return False
+
+        url = f"{_BASE_URL}/api/v1/edges/{_EDGE_MAC}/iot-devices"
+        payload = {
+            "iotMac":   _IOT_MAC,
+            "username": _ADMIN_USERNAME,
+            "password": _ADMIN_PASSWORD,
+        }
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers=CloudApiClient._headers(),
+                timeout=_TIMEOUT,
+            )
+            if response.status_code == 409:
+                logger.info(
+                    "IoT Device '%s' ya estaba registrado en el cloud (409).", _IOT_MAC
+                )
+                return True
+            response.raise_for_status()
+            logger.info(
+                "IoT Device '%s' registrado en el cloud y asociado a Edge '%s' (201).",
+                _IOT_MAC,
+                _EDGE_MAC,
+            )
+            return True
+
+        except requests.exceptions.ConnectionError:
+            logger.warning("Cloud no disponible al registrar IoT Device (ConnectionError).")
+        except requests.exceptions.Timeout:
+            logger.warning("Timeout al registrar IoT Device en el cloud (>%ds).", _TIMEOUT)
+        except requests.exceptions.HTTPError as exc:
+            logger.warning(
+                "Error HTTP %s al registrar IoT Device: %s.", exc.response.status_code, exc
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Error inesperado al registrar IoT Device: %s.", exc)
 
         return False

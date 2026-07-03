@@ -6,8 +6,9 @@ y ejecuta el bootstrap al iniciar la aplicación.
 
 Bootstrap (ejecutado en create_app, antes de aceptar requests):
   1. Inicializa la base de datos SQLite y crea las tablas si no existen.
-  2. Siembra el dispositivo de prueba (smart-palm-001) si no está registrado.
-  3. Sincroniza umbrales agronómicos desde el Web Service central.
+  2. Registra el Edge Device y el IoT Device en el Web Service central.
+  3. Siembra el dispositivo de prueba (smart-palm-001) si no está registrado.
+  4. Sincroniza umbrales agronómicos desde el Web Service central.
 
 Variables de entorno:
   DATABASE_PATH   — Ruta al archivo SQLite (default: edge_data.db)
@@ -36,6 +37,7 @@ from iam.infrastructure.repositories import DeviceRepository
 from iam.interfaces.routes import iam_api
 from shared.infrastructure.database import init_db
 from telemetry.application.threshold_sync import ThresholdSyncService
+from telemetry.infrastructure.cloud_client import CloudApiClient
 from telemetry.infrastructure.database import (
     AgronomicThresholdModel,
     SensorReadingModel,
@@ -96,10 +98,30 @@ def create_app() -> Flask:
     # 1. Inicializar base de datos
     init_db(_DATABASE_PATH, _DB_MODELS)
 
-    # 2. Sembrar dispositivo de prueba
+    # 2. Registrar dispositivos en el cloud (idempotente: 409 = ya registrado)
+    edge_registered = CloudApiClient.register_edge_device()
+    if edge_registered:
+        CloudApiClient.register_iot_device()
+    else:
+        logger.warning(
+            "No se pudo registrar el Edge Device en el cloud — "
+            "IoT Device y umbrales no se sincronizarán."
+        )
+
+    # 2.5 Sincronizar lista de IoT devices autorizados desde el Cloud al IAM local
+    mac_list = CloudApiClient.fetch_registry()
+    new_count = _auth_service.sync_from_registry(mac_list)
+    if new_count > 0:
+        logger.info("Registry sincronizado: %d device(s) nuevo(s) añadidos al IAM.", new_count)
+    elif mac_list:
+        logger.info("Registry sincronizado: todos los devices ya estaban en el IAM local.")
+    else:
+        logger.info("Registry vacío o no disponible — IAM local sin cambios.")
+
+    # 3. Sembrar dispositivo de prueba en IAM local
     _auth_service.seed_test_device()
 
-    # 3. Sincronizar umbrales desde el cloud
+    # 4. Sincronizar umbrales desde el cloud
     synced = _sync_service.sync(_TEST_DEVICE_ID)
     if synced == 0:
         logger.info(
