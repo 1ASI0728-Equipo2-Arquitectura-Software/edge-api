@@ -9,23 +9,28 @@ los métodos retornan valores seguros en lugar de propagar excepciones,
 permitiendo que el Edge API opere en modo offline.
 
 Endpoints del Web Service utilizados:
-  GET  /api/v1/edges/{edgeMac}/iot-devices/{iotMac}/thresholds
-         — Obtiene el umbral agronómico configurado para el par edge/iot.
-         — Respuesta: { "edgeMac", "iotMac", "min", "max", "description", "type" }
-         — 404 si aún no hay umbral configurado para ese par.
-  POST /api/v1/edges/{edgeMac}/sensor-readings
-         — Envía el lote de lecturas en formato ReadDeviceSensorsDataResource.
-         — Respuesta: 200 OK (sin cuerpo).
+  GET  /api/v1/devices/{iotMac}/thresholds
+         — Obtiene el umbral agronómico configurado para el dispositivo IoT.
+         — Respuesta: [{ "edgeMac", "iotMac", "min", "max", "description", "type" }, ...]
+         — 404 si aún no hay umbral configurado para ese dispositivo.
+  POST /api/v1/edge-gateways/{gatewayMac}/sensor-readings
+         — Envía el lote de lecturas agrupado por dispositivo IoT.
+         — Respuesta: 201 Created (sin cuerpo).
 
-Payload esperado por el endpoint /digest:
+Payload esperado por el endpoint /sensor-readings:
   {
-      "readings": [
-          {"sensorType": "Temperature",  "measuredAt": "...", "value": 25.5},
-          {"sensorType": "Humidity",     "measuredAt": "...", "value": 65.0},
-          {"sensorType": "SoilMoisture", "measuredAt": "...", "value": 45.0},
-          {"sensorType": "Luminosity",   "measuredAt": "...", "value": 78.0}
+      "devices": [
+          {
+              "deviceMac": "...",
+              "readings": [
+                  {"sensorType": "Temperature",  "measuredAt": "...", "value": 25.5},
+                  {"sensorType": "Humidity",     "measuredAt": "...", "value": 65.0},
+                  {"sensorType": "SoilMoisture", "measuredAt": "...", "value": 45.0},
+                  {"sensorType": "Luminosity",   "measuredAt": "...", "value": 78.0}
+              ]
+          }
       ],
-      "measuredAt": "..."
+      "syncedAt": "..."
   }
 
 Configuración (variables de entorno):
@@ -109,37 +114,34 @@ class CloudApiClient:
     @staticmethod
     def get_thresholds(device_id: str) -> list[AgronomicThreshold]:
         """
-        Obtiene el umbral agronómico configurado para el par edge/iot.
+        Obtiene el umbral agronómico configurado para el dispositivo IoT.
 
-        Hace GET a /api/v1/device/edge/{edgeMac}/iot/{iotMac}/threshold.
+        Hace GET a /api/v1/devices/{iotMac}/thresholds.
         Si el cloud no responde o retorna un error, retorna lista vacía
         para que TelemetryDomainService use los valores por defecto.
 
-        El backend identifica los dispositivos por MAC address (EDGE_MAC e
-        IOT_MAC), no por el device_id interno del Edge API. El parámetro
-        device_id se conserva para compatibilidad con ThresholdSyncService
-        pero no se utiliza en la construcción de la URL.
+        El backend identifica al dispositivo por su MAC address (IOT_MAC),
+        no por el device_id interno del Edge API. El parámetro device_id
+        se conserva para compatibilidad con ThresholdSyncService pero no se
+        utiliza en la construcción de la URL.
 
         Args:
             device_id: Identificador interno del dispositivo (no utilizado
                        en la ruta; la identificación en el cloud se realiza
-                       mediante las variables de entorno EDGE_MAC e IOT_MAC).
+                       mediante la variable de entorno IOT_MAC).
 
         Returns:
             Lista con un AgronomicThreshold sincronizado desde el cloud,
-            o lista vacía si el cloud no está disponible o las variables
-            de entorno no están configuradas.
+            o lista vacía si el cloud no está disponible o la variable
+            de entorno no está configurada.
         """
-        if not _EDGE_MAC or not _IOT_MAC:
+        if not _IOT_MAC:
             logger.debug(
-                "EDGE_MAC o IOT_MAC no configurados — sincronización de umbrales omitida."
+                "IOT_MAC no configurado — sincronización de umbrales omitida."
             )
             return []
 
-        url = (
-            f"{_BASE_URL}/api/v1/edges/{_EDGE_MAC}"
-            f"/iot-devices/{_IOT_MAC}/thresholds"
-        )
+        url = f"{_BASE_URL}/api/v1/devices/{_IOT_MAC}/thresholds"
         try:
             response = requests.get(
                 url,
@@ -191,8 +193,7 @@ class CloudApiClient:
             if exc.response.status_code == 404:
                 # 404 es estado normal: aún no hay umbral configurado en el backend.
                 logger.info(
-                    "Sin umbral configurado en el cloud para edge=%s iot=%s (404).",
-                    _EDGE_MAC,
+                    "Sin umbral configurado en el cloud para iot=%s (404).",
                     _IOT_MAC,
                 )
             else:
@@ -211,8 +212,8 @@ class CloudApiClient:
         """
         Reenvía un lote de lecturas al Web Service central.
 
-        Hace POST a /api/v1/device/edge/{edgeMac}/digest con el payload
-        en formato ReadDeviceSensorsDataResource esperado por el backend.
+        Hace POST a /api/v1/edge-gateways/{edgeMac}/sensor-readings con el
+        payload agrupado por dispositivo IoT esperado por el backend.
         Si el cloud no responde, retorna False sin interrumpir el flujo
         principal del Edge API (el lote ya fue persistido localmente).
 
@@ -230,19 +231,24 @@ class CloudApiClient:
             logger.debug("EDGE_MAC no configurado — reenvío al cloud omitido.")
             return False
 
-        url = f"{_BASE_URL}/api/v1/edges/{_EDGE_MAC}/sensor-readings"
+        url = f"{_BASE_URL}/api/v1/edge-gateways/{_EDGE_MAC}/sensor-readings"
         timestamp = record.recorded_at.isoformat()
 
         payload = {
-            "readings": [
+            "devices": [
                 {
-                    "sensorType": _to_sensor_type(r.variable),
-                    "measuredAt": r.timestamp.isoformat(),
-                    "value": r.value,
+                    "deviceMac": record.device_id,
+                    "readings": [
+                        {
+                            "sensorType": _to_sensor_type(r.variable),
+                            "measuredAt": r.timestamp.isoformat(),
+                            "value": r.value,
+                        }
+                        for r in record.readings
+                    ],
                 }
-                for r in record.readings
             ],
-            "measuredAt": timestamp,
+            "syncedAt": timestamp,
         }
 
         try:
@@ -290,7 +296,7 @@ class CloudApiClient:
         """
         Obtiene la lista de IoT Devices autorizados para este Edge desde el Cloud.
 
-        Hace GET a /api/v1/edges/{edgeMac}/registry y extrae los iotDeviceMac
+        Hace GET a /api/v1/edge-gateways/{edgeMac}/registry y extrae los iotDeviceMac
         del campo `registry`. Si el Cloud no responde o el Edge no está aún
         registrado (404), retorna lista vacía y el IAM local usará lo que ya
         tenga en SQLite de sincronizaciones anteriores.
@@ -303,7 +309,7 @@ class CloudApiClient:
             logger.debug("EDGE_MAC no configurado — fetch de registry omitido.")
             return []
 
-        url = f"{_BASE_URL}/api/v1/edges/{_EDGE_MAC}/registry"
+        url = f"{_BASE_URL}/api/v1/edge-gateways/{_EDGE_MAC}/registry"
         try:
             response = requests.get(
                 url,
@@ -342,7 +348,7 @@ class CloudApiClient:
         """
         Registra el Edge Device en el Cloud si aún no existe.
 
-        Hace POST a /api/v1/edges con la MAC y monitoringZoneId configurados.
+        Hace POST a /api/v1/edge-gateways con la MAC y monitoringZoneId configurados.
         Un 409 Conflict indica que el device ya estaba registrado — se trata
         como éxito para que el bootstrap sea idempotente en reinicios.
 
@@ -354,7 +360,7 @@ class CloudApiClient:
             logger.warning("EDGE_MAC no configurado — registro del Edge Device omitido.")
             return False
 
-        url = f"{_BASE_URL}/api/v1/edges"
+        url = f"{_BASE_URL}/api/v1/edge-gateways"
         payload = {
             "edgeMac":          _EDGE_MAC,
             "monitoringZoneId": _ZONE_ID,
@@ -393,7 +399,7 @@ class CloudApiClient:
         """
         Registra el IoT Device en el Cloud asociándolo al Edge Device.
 
-        Hace POST a /api/v1/edges/{edgeMac}/iot-devices con la MAC del D1.
+        Hace POST a /api/v1/edge-gateways/{edgeMac}/iot-devices con la MAC del D1.
         Requiere que el Edge Device ya esté registrado. Un 409 indica que
         el IoT Device ya existía — se trata como éxito (idempotente).
         El backend publica IotDeviceRegisteredEvent al registrar por primera
@@ -409,7 +415,7 @@ class CloudApiClient:
             )
             return False
 
-        url = f"{_BASE_URL}/api/v1/edges/{_EDGE_MAC}/iot-devices"
+        url = f"{_BASE_URL}/api/v1/edge-gateways/{_EDGE_MAC}/iot-devices"
         payload = {
             "iotMac":   _IOT_MAC,
             "username": _ADMIN_USERNAME,
