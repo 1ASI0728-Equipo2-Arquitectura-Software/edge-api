@@ -35,5 +35,5 @@ dist/
 build/
 /edge_data.db-journal
 
-
+docs/
 context/

@@ -13,6 +13,7 @@ y en el repositorio para persistencia.
 
 import logging
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from iam.domain.model import Device
 from iam.domain.services import DeviceDomainService, IDeviceRepository
@@ -79,3 +80,30 @@ class AuthApplicationService:
         logger.info(
             "Dispositivo de prueba sembrado: device_id='%s'", _TEST_DEVICE_ID
         )
+
+    def sync_from_registry(self, mac_list: list[str]) -> int:
+        """
+        Sincroniza el IAM local con la lista de MACs autorizadas por el Cloud.
+
+        Por cada MAC recibida del registry del Cloud, si el dispositivo no
+        existe aún en SQLite, genera un api_key UUID y lo persiste. Dispositivos
+        ya registrados conservan su api_key existente (idempotente en reinicios).
+
+        Args:
+            mac_list: Lista de MAC addresses obtenidas de GET /registry en Cloud.
+
+        Returns:
+            Número de dispositivos nuevos añadidos al IAM local.
+        """
+        new_count = 0
+        for mac in mac_list:
+            if self._repo.find_by_device_id(mac) is None:
+                device = Device(
+                    device_id=mac,
+                    api_key=str(uuid4()),
+                    created_at=datetime.now(timezone.utc),
+                )
+                self._repo.save(device)
+                logger.info("Dispositivo registrado en IAM local: device_id='%s'.", mac)
+                new_count += 1
+        return new_count
