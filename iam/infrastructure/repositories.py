@@ -55,3 +55,20 @@ class DeviceRepository(IDeviceRepository):
                 "created_at": device.created_at,
             },
         )
+
+    @staticmethod
+    def find_all() -> list[Device]:
+        """
+        Retorna todos los dispositivos registrados en la tabla `devices`.
+
+        Returns:
+            Lista de Device (vacía si no hay ninguno registrado).
+        """
+        return [
+            Device(
+                device_id=record.device_id,
+                api_key=record.api_key,
+                created_at=record.created_at,
+            )
+            for record in DeviceModel.select()
+        ]

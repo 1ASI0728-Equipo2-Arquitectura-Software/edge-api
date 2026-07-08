@@ -22,6 +22,8 @@ from flask import Blueprint, jsonify, request
 from iam.application.services import AuthApplicationService
 from iam.infrastructure.repositories import DeviceRepository
 
+_device_repo = DeviceRepository()
+
 logger = logging.getLogger(__name__)
 
 iam_api = Blueprint("iam_api", __name__)
@@ -57,3 +59,25 @@ def verify_credentials():
 
     logger.info("Credenciales verificadas: device_id='%s'.", device_id)
     return jsonify({"device_id": device_id, "status": "authenticated"}), 200
+
+
+@iam_api.get("/api/v1/authorized-devices")
+def get_authorized_devices():
+    """
+    Retorna la lista de IoT Devices autorizados almacenados en el IAM local.
+
+    Endpoint interno consumido por el Edge Node (ESP32) al arrancar para
+    cargar en memoria la lista de dispositivos que puede autenticar.
+    No requiere autenticación ya que solo es accesible desde la red local.
+
+    Returns:
+        200: Lista de dispositivos con su api_key.
+             [ { "device_id": "<mac>", "api_key": "<key>" }, ... ]
+    """
+    devices = _device_repo.find_all()
+    payload = [
+        {"device_id": d.device_id, "api_key": d.api_key}
+        for d in devices
+    ]
+    logger.info("Edge Node consultó authorized-devices: %d device(s) retornados.", len(payload))
+    return jsonify(payload), 200
