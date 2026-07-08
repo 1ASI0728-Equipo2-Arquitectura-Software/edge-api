@@ -15,10 +15,10 @@ Variables de entorno:
   CLOUD_BASE_URL  — URL base del Web Service (default: http://localhost:5000)
   EDGE_MAC        — Dirección MAC de este nodo edge registrada en el backend
                     (p.ej. AA:BB:CC:DD:EE:FF). Requerida para el envío de
-                    telemetría al endpoint /api/v1/device/edge/{edgeMac}/digest.
+                    telemetría al endpoint /api/v1/edge-gateways/{gatewayMac}/sensor-readings.
   IOT_MAC         — Dirección MAC del dispositivo IoT registrada en el backend
                     (p.ej. BB:CC:DD:EE:FF:AA). Requerida para la sincronización
-                    de umbrales desde /api/v1/device/edge/{iotMac}/threshold.
+                    de umbrales desde /api/v1/devices/{iotMac}/thresholds.
   CLOUD_API_KEY   — API key para el Web Service (default: vacío)
   CLOUD_TIMEOUT   — Timeout HTTP en segundos (default: 5)
 """
@@ -36,6 +36,7 @@ from iam.infrastructure.database import DeviceModel
 from iam.infrastructure.repositories import DeviceRepository
 from iam.interfaces.routes import iam_api
 from shared.infrastructure.database import init_db
+from shared.infrastructure.discovery import register_mdns_service
 from telemetry.application.threshold_sync import ThresholdSyncService
 from telemetry.infrastructure.cloud_client import CloudApiClient
 from telemetry.infrastructure.database import (
@@ -97,6 +98,11 @@ def create_app() -> Flask:
 
     # 1. Inicializar base de datos
     init_db(_DATABASE_PATH, _DB_MODELS)
+
+    # 1.5 Anunciar este Edge API por mDNS (_smartpalm._tcp) para que el
+    #     Edge Node (ESP32) descubra la IP de esta máquina en cualquier red.
+    #     Falla silenciosa si zeroconf no está disponible.
+    register_mdns_service(port=5001)
 
     # 2. Registrar dispositivos en el cloud (idempotente: 409 = ya registrado)
     edge_registered = CloudApiClient.register_edge_device()
