@@ -57,12 +57,14 @@ class TelemetryRepository(ITelemetryRepository):
         with db.atomic():
             telemetry_model = TelemetryRecordModel.create(
                 device_id=record.device_id,
+                owner_user_id=record.owner_user_id,
                 recorded_at=record.recorded_at,
             )
 
             reading_rows = [
                 {
                     "record": telemetry_model.id,
+                    "owner_user_id": record.owner_user_id,
                     "variable": reading.variable,
                     "value": reading.value,
                     "unit": reading.unit,
@@ -82,6 +84,37 @@ class TelemetryRepository(ITelemetryRepository):
             )
 
         return telemetry_model.id
+
+    @staticmethod
+    def find_by_owner_user_id(owner_user_id: int) -> list[TelemetryRecordModel]:
+        return list(
+            TelemetryRecordModel.select()
+            .where(TelemetryRecordModel.owner_user_id == owner_user_id)
+            .order_by(TelemetryRecordModel.recorded_at)
+        )
+
+    @staticmethod
+    def export_by_owner_user_id(owner_user_id: int) -> list[dict]:
+        records = TelemetryRepository.find_by_owner_user_id(owner_user_id)
+        return [
+            {
+                "id": record.id,
+                "device_id": record.device_id,
+                "owner_user_id": record.owner_user_id,
+                "recorded_at": record.recorded_at.isoformat(),
+                "readings": [
+                    {
+                        "variable": reading.variable,
+                        "value": reading.value,
+                        "unit": reading.unit,
+                        "timestamp": reading.timestamp.isoformat(),
+                        "owner_user_id": reading.owner_user_id,
+                    }
+                    for reading in record.readings
+                ],
+            }
+            for record in records
+        ]
 
 
 class AgronomicThresholdRepository(IAgronomicThresholdRepository):
@@ -165,6 +198,7 @@ class CloudOutboxRepository:
         payload = json.dumps(
             {
                 "device_id": record.device_id,
+                "owner_user_id": record.owner_user_id,
                 "recorded_at": record.recorded_at.isoformat(),
                 "readings": [
                     {
@@ -218,6 +252,7 @@ class CloudOutboxRepository:
         data = json.loads(item.payload)
         return TelemetryRecord(
             device_id=data["device_id"],
+            owner_user_id=int(data.get("owner_user_id", 0)),
             recorded_at=datetime.fromisoformat(data["recorded_at"]),
             readings=[
                 SensorReadingValue(

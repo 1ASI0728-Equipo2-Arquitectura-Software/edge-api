@@ -19,6 +19,7 @@ from telemetry.domain.services import (
     TelemetryDomainService,
 )
 from telemetry.infrastructure.repositories import CloudOutboxRepository
+from iam.infrastructure.repositories import DeviceRepository
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +37,11 @@ class TelemetryApplicationService:
         self,
         telemetry_repository: ITelemetryRepository,
         threshold_repository: IAgronomicThresholdRepository,
+        device_repository: DeviceRepository | None = None,
     ) -> None:
         self._telemetry_repo = telemetry_repository
         self._domain_service = TelemetryDomainService(threshold_repository)
+        self._device_repository = device_repository or DeviceRepository()
 
     def record_telemetry(
         self,
@@ -74,10 +77,14 @@ class TelemetryApplicationService:
             raise ValueError("El lote de lecturas no puede estar vacío.")
 
         readings = self._parse_readings(readings_data)
+        device = self._device_repository.find_by_device_id(device_id)
+        if device is None or device.owner_user_id <= 0:
+            raise ValueError("El dispositivo no tiene un propietario válido en el registry.")
 
         record = TelemetryRecord(
             device_id=device_id,
             readings=readings,
+            owner_user_id=device.owner_user_id,
             recorded_at=datetime.now(timezone.utc),
         )
 
