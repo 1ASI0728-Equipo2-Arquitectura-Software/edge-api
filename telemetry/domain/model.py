@@ -55,6 +55,7 @@ class TelemetryRecord:
     recorded_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    owner_user_id: int = 0
 
     def get_reading(self, variable: str) -> SensorReadingValue | None:
         """

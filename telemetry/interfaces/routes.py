@@ -17,7 +17,9 @@ La autenticación se realiza en cada request validando el par
 (X-Device-Id, X-Api-Key) contra el repositorio local de dispositivos.
 """
 
+import hmac
 import logging
+import os
 
 from flask import Blueprint, jsonify, request
 
@@ -32,6 +34,18 @@ from telemetry.infrastructure.repositories import (
 logger = logging.getLogger(__name__)
 
 telemetry_api = Blueprint("telemetry_api", __name__)
+
+
+def _export_scope_is_valid() -> bool:
+    expected_key = os.getenv("EDGE_NODE_KEY", "").strip()
+    supplied_key = request.headers.get("X-Edge-Node-Key", "")
+    configured_owner = os.getenv("EDGE_EXPORT_OWNER_USER_ID", "").strip()
+    return (
+        bool(expected_key)
+        and hmac.compare_digest(supplied_key, expected_key)
+        and configured_owner.isdigit()
+        and int(configured_owner) > 0
+    )
 
 # ---------------------------------------------------------------------------
 # Instancias de servicios (stateless — seguro compartir entre requests)
@@ -89,3 +103,24 @@ def post_telemetry():
         return jsonify({"error": "Error interno del servidor."}), 500
 
     return jsonify({"id": record_id, "alert_flags": alert_flags}), 201
+
+
+@telemetry_api.get("/api/v1/telemetry/export")
+def export_telemetry():
+    """Export the owner scope configured for this trusted internal Edge client.
+
+    The owner is deliberately not accepted from the request URL or query
+    string. A deployment must configure EDGE_EXPORT_OWNER_USER_ID alongside
+    EDGE_NODE_KEY; this endpoint is for internal, scoped consumers only.
+    """
+    if not _export_scope_is_valid():
+        return jsonify({"error": "Unauthorized"}), 401
+    if "owner_user_id" in request.args:
+        return jsonify({"error": "owner_user_id is not accepted; use the configured export scope"}), 400
+    owner_user_id = int(os.getenv("EDGE_EXPORT_OWNER_USER_ID", "0"))
+    return jsonify(
+        {
+            "owner_user_id": owner_user_id,
+            "records": TelemetryRepository.export_by_owner_user_id(owner_user_id),
+        }
+    )

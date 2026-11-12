@@ -57,6 +57,7 @@ from typing import Optional
 import requests
 
 from telemetry.domain.model import AgronomicThreshold, TelemetryRecord
+from telemetry.domain.time import to_utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,21 @@ _ADMIN_PASSWORD = os.getenv("CLOUD_ADMIN_PASSWORD", "admin")
 # ───────────────────────────────────────────────────────────────────────────
 _TOKEN_TTL_SECONDS = 50 * 60  # se refresca antes de que el JWT expire (~1h)
 _token_cache: dict = {"token": None, "expires_at": 0.0}
+
+
+def _safe_response_message(response: requests.Response) -> str:
+    """Extracts a bounded server message without exposing credentials or tokens."""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            message = payload.get("message") or payload.get("title") or payload.get("detail")
+            if message:
+                return str(message)[:500]
+    except ValueError:
+        pass
+
+    text = response.text.strip()
+    return text[:500] if text else "empty response body"
 
 
 def _get_auth_token() -> Optional[str]:
@@ -250,7 +266,7 @@ class CloudApiClient:
                 logger.warning(
                     "Error HTTP %s al obtener umbrales del cloud: %s.",
                     exc.response.status_code,
-                    exc,
+                    _safe_response_message(exc.response),
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Error inesperado al obtener umbrales del cloud: %s.", exc)
@@ -282,7 +298,7 @@ class CloudApiClient:
             return False
 
         url = f"{_BASE_URL}/api/v1/edge-gateways/{_EDGE_MAC}/sensor-readings"
-        timestamp = record.recorded_at.isoformat()
+        timestamp = to_utc_iso(record.recorded_at)
 
         payload = {
             "devices": [
@@ -291,7 +307,7 @@ class CloudApiClient:
                     "readings": [
                         {
                             "sensorType": _to_sensor_type(r.variable),
-                            "measuredAt": r.timestamp.isoformat(),
+                            "measuredAt": to_utc_iso(r.timestamp),
                             "value": r.value,
                         }
                         for r in record.readings
@@ -334,7 +350,7 @@ class CloudApiClient:
             logger.warning(
                 "Error HTTP %s al reenviar lote al cloud: %s.",
                 exc.response.status_code,
-                exc,
+                _safe_response_message(exc.response),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Error inesperado al reenviar lote al cloud: %s.", exc)

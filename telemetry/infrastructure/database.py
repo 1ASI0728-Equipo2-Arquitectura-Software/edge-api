@@ -39,6 +39,7 @@ class TelemetryRecordModel(Model):
 
     id = AutoField()
     device_id = CharField(max_length=100, index=True)
+    owner_user_id = IntegerField(default=0, index=True)
     recorded_at = DateTimeField(
         default=lambda: datetime.now(timezone.utc)
     )
@@ -69,6 +70,7 @@ class SensorReadingModel(Model):
         backref="readings",
         on_delete="CASCADE",
     )
+    owner_user_id = IntegerField(default=0, index=True)
     variable = CharField(max_length=50, index=True)
     value = FloatField()
     unit = CharField(max_length=20)
