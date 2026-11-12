@@ -9,7 +9,6 @@ agronómicos, persistirlas localmente y reenviarlas al cloud.
 """
 
 import logging
-import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,7 +18,7 @@ from telemetry.domain.services import (
     ITelemetryRepository,
     TelemetryDomainService,
 )
-from telemetry.infrastructure.cloud_client import CloudApiClient
+from telemetry.infrastructure.repositories import CloudOutboxRepository
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +52,7 @@ class TelemetryApplicationService:
         1. Construye TelemetryRecord desde los datos raw del request.
         2. Evalúa alertas contra umbrales agronómicos (domain service).
         3. Persiste el record localmente (SQLite).
-        4. Reenvía el lote al Web Service central (fire-and-forget).
+        4. Encola el lote para reintento durable hacia el Web Service central.
         5. Retorna (record_id, alert_flags) al caller (Blueprint).
 
         Args:
@@ -85,6 +84,7 @@ class TelemetryApplicationService:
         alert_flags = self._domain_service.evaluate_alerts(record)
 
         record_id = self._telemetry_repo.save(record)
+        CloudOutboxRepository.enqueue(record)
 
         logger.info(
             "Telemetría registrada: record_id=%d device_id='%s' alertas=%s.",
@@ -92,14 +92,6 @@ class TelemetryApplicationService:
             device_id,
             {k: v for k, v in alert_flags.items() if v},
         )
-
-        # Fire-and-forget real: lanza el reenvío en un hilo de fondo para
-        # que Flask responda 201 al ESP32 de inmediato, sin esperar al cloud.
-        threading.Thread(
-            target=CloudApiClient.post_telemetry_batch,
-            args=(record,),
-            daemon=True,
-        ).start()
 
         return record_id, alert_flags
 

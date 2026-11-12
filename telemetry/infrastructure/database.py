@@ -18,6 +18,8 @@ from peewee import (
     FloatField,
     ForeignKeyField,
     AutoField,
+    IntegerField,
+    TextField,
 )
 
 from shared.infrastructure.database import db
@@ -99,3 +101,19 @@ class AgronomicThresholdModel(Model):
     class Meta:
         database = db
         table_name = "agronomic_thresholds"
+
+
+class CloudOutboxModel(Model):
+    """Lote local pendiente de confirmación por el backend central."""
+
+    id = AutoField()
+    payload = TextField()
+    attempts = IntegerField(default=0)
+    next_attempt_at = DateTimeField(default=lambda: datetime.now(timezone.utc))
+    sent_at = DateTimeField(null=True)
+    last_error = TextField(null=True)
+    created_at = DateTimeField(default=lambda: datetime.now(timezone.utc))
+
+    class Meta:
+        database = db
+        table_name = "cloud_outbox"
