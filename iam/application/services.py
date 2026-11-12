@@ -3,25 +3,21 @@ iam/application/services.py
 
 Application service del bounded context IAM.
 
-AuthApplicationService orquesta los casos de uso de autenticación:
-- authenticate: valida credenciales de un dispositivo IoT.
-- seed_test_device: siembra un dispositivo de prueba en bootstrap.
+AuthApplicationService orquesta la autenticación de dispositivos IoT.
 
 Esta capa no contiene lógica de negocio; delega en DeviceDomainService
 y en el repositorio para persistencia.
 """
 
 import logging
+import secrets
 from datetime import datetime, timezone
-from uuid import uuid4
 
-from iam.domain.model import Device
+from iam.domain.model import credential_hash
 from iam.domain.services import DeviceDomainService, IDeviceRepository
 
 logger = logging.getLogger(__name__)
 
-_TEST_DEVICE_ID = "smart-palm-001"
-_TEST_API_KEY = "sp-test-api-key-123"
 
 
 class AuthApplicationService:
@@ -55,55 +51,44 @@ class AuthApplicationService:
             )
         return result
 
-    def seed_test_device(self) -> None:
+    def sync_from_registry(self, registry: list[dict | str]) -> int:
         """
-        Siembra el dispositivo de prueba si aún no existe en la base de datos.
-
-        Llamado una sola vez durante el bootstrap de la aplicación (before_request).
-        Garantiza que el ESP32 pueda autenticarse con credenciales conocidas en
-        entornos de desarrollo y prueba.
-        """
-        existing = self._repo.find_by_device_id(_TEST_DEVICE_ID)
-        if existing is not None:
-            logger.debug(
-                "Dispositivo de prueba '%s' ya existe, seed omitido.",
-                _TEST_DEVICE_ID,
-            )
-            return
-
-        test_device = Device(
-            device_id=_TEST_DEVICE_ID,
-            api_key=_TEST_API_KEY,
-            created_at=datetime.now(timezone.utc),
-        )
-        self._repo.save(test_device)
-        logger.info(
-            "Dispositivo de prueba sembrado: device_id='%s'", _TEST_DEVICE_ID
-        )
-
-    def sync_from_registry(self, mac_list: list[str]) -> int:
-        """
-        Sincroniza el IAM local con la lista de MACs autorizadas por el Cloud.
-
-        Por cada MAC recibida del registry del Cloud, si el dispositivo no
-        existe aún en SQLite, genera un api_key UUID y lo persiste. Dispositivos
-        ya registrados conservan su api_key existente (idempotente en reinicios).
+        Sincroniza metadatos y el hash de bootstrap sin crear API keys.
 
         Args:
-            mac_list: Lista de MAC addresses obtenidas de GET /registry en Cloud.
+            registry: Entradas completas obtenidas de GET /registry en Cloud.
 
         Returns:
             Número de dispositivos nuevos añadidos al IAM local.
         """
         new_count = 0
-        for mac in mac_list:
-            if self._repo.find_by_device_id(mac) is None:
-                device = Device(
-                    device_id=mac,
-                    api_key=str(uuid4()),
-                    created_at=datetime.now(timezone.utc),
-                )
-                self._repo.save(device)
-                logger.info("Dispositivo registrado en IAM local: device_id='%s'.", mac)
-                new_count += 1
+        for raw_entry in registry:
+            entry = {"iotDeviceMac": raw_entry} if isinstance(raw_entry, str) else raw_entry
+            device_id = str(entry.get("iotDeviceMac") or entry.get("device_id") or "").strip()
+            if not device_id:
+                continue
+            existed = self._repo.find_by_device_id(device_id) is not None
+            if self._repo.sync_registry_entry(entry):
+                new_count += 0 if existed else 1
+                logger.info("Registry sincronizado: device_id='%s'.", device_id)
         return new_count
+
+    def provision(self, device_id: str, bootstrap_key: str) -> tuple[str, datetime]:
+        device = self._repo.find_by_device_id(device_id)
+        if device is None:
+            raise LookupError("Dispositivo no registrado en el Edge API.")
+        if not device.is_active:
+            raise PermissionError("Dispositivo inactivo.")
+        if device.is_provisioned:
+            raise RuntimeError("El bootstrap ya fue utilizado; se requiere revocación explícita.")
+        if not device.matches_bootstrap(bootstrap_key):
+            raise PermissionError("Bootstrap inválido.")
+
+        api_key = secrets.token_urlsafe(32)
+        provisioned_at = datetime.now(timezone.utc)
+        if not self._repo.provision(device_id, credential_hash(api_key), provisioned_at):
+            raise RuntimeError("El dispositivo fue provisionado por otra solicitud.")
+        return api_key, provisioned_at
+
+    def revoke(self, device_id: str) -> bool:
+        return self._repo.revoke(device_id, datetime.now(timezone.utc))

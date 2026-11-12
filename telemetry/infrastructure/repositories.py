@@ -10,14 +10,17 @@ AgronomicThresholdRepository — persiste y consulta umbrales agronómicos sincr
 """
 
 import logging
+import json
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from telemetry.domain.model import AgronomicThreshold, TelemetryRecord
+from telemetry.domain.model import AgronomicThreshold, SensorReadingValue, TelemetryRecord
 from telemetry.domain.services import IAgronomicThresholdRepository, ITelemetryRepository
 from telemetry.infrastructure.database import (
     AgronomicThresholdModel,
     SensorReadingModel,
     TelemetryRecordModel,
+    CloudOutboxModel,
 )
 from shared.infrastructure.database import db
 
@@ -106,6 +109,8 @@ class AgronomicThresholdRepository(IAgronomicThresholdRepository):
             record = AgronomicThresholdModel.get(
                 AgronomicThresholdModel.variable == variable
             )
+
+
             return AgronomicThreshold(
                 variable=record.variable,
                 min_value=record.min_value,
@@ -150,3 +155,77 @@ class AgronomicThresholdRepository(IAgronomicThresholdRepository):
                 threshold.min_value,
                 threshold.max_value,
             )
+
+
+class CloudOutboxRepository:
+    """Persistencia de reintentos de entrega hacia el backend central."""
+
+    @staticmethod
+    def enqueue(record: TelemetryRecord) -> int:
+        payload = json.dumps(
+            {
+                "device_id": record.device_id,
+                "recorded_at": record.recorded_at.isoformat(),
+                "readings": [
+                    {
+                        "variable": value.variable,
+                        "value": value.value,
+                        "unit": value.unit,
+                        "timestamp": value.timestamp.isoformat(),
+                    }
+                    for value in record.readings
+                ],
+            }
+        )
+        with db.atomic():
+            return CloudOutboxModel.create(payload=payload).id
+
+    @staticmethod
+    def due(limit: int = 10) -> list[CloudOutboxModel]:
+        now = datetime.now(timezone.utc)
+        return list(
+            CloudOutboxModel.select()
+            .where(
+                CloudOutboxModel.sent_at.is_null(True)
+                & (CloudOutboxModel.next_attempt_at <= now)
+            )
+            .order_by(CloudOutboxModel.created_at)
+            .limit(limit)
+        )
+
+    @staticmethod
+    def mark_sent(item: CloudOutboxModel) -> None:
+        item.sent_at = datetime.now(timezone.utc)
+        item.last_error = None
+        item.save(only=[CloudOutboxModel.sent_at, CloudOutboxModel.last_error])
+
+    @staticmethod
+    def mark_failed(item: CloudOutboxModel, error: str) -> None:
+        item.attempts += 1
+        delay_seconds = min(300, 2 ** min(item.attempts, 8))
+        item.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        item.last_error = error[:1000]
+        item.save(
+            only=[
+                CloudOutboxModel.attempts,
+                CloudOutboxModel.next_attempt_at,
+                CloudOutboxModel.last_error,
+            ]
+        )
+
+    @staticmethod
+    def to_domain(item: CloudOutboxModel) -> TelemetryRecord:
+        data = json.loads(item.payload)
+        return TelemetryRecord(
+            device_id=data["device_id"],
+            recorded_at=datetime.fromisoformat(data["recorded_at"]),
+            readings=[
+                SensorReadingValue(
+                    variable=value["variable"],
+                    value=float(value["value"]),
+                    unit=value["unit"],
+                    timestamp=datetime.fromisoformat(value["timestamp"]),
+                )
+                for value in data["readings"]
+            ],
+        )
