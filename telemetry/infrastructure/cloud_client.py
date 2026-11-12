@@ -79,6 +79,21 @@ _TOKEN_TTL_SECONDS = 50 * 60  # se refresca antes de que el JWT expire (~1h)
 _token_cache: dict = {"token": None, "expires_at": 0.0}
 
 
+def _safe_response_message(response: requests.Response) -> str:
+    """Extracts a bounded server message without exposing credentials or tokens."""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            message = payload.get("message") or payload.get("title") or payload.get("detail")
+            if message:
+                return str(message)[:500]
+    except ValueError:
+        pass
+
+    text = response.text.strip()
+    return text[:500] if text else "empty response body"
+
+
 def _get_auth_token() -> Optional[str]:
     """Obtiene (y cachea) un JWT autenticándose como administrador en el cloud."""
     if _token_cache["token"] and time.time() < _token_cache["expires_at"]:
@@ -251,7 +266,7 @@ class CloudApiClient:
                 logger.warning(
                     "Error HTTP %s al obtener umbrales del cloud: %s.",
                     exc.response.status_code,
-                    exc,
+                    _safe_response_message(exc.response),
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Error inesperado al obtener umbrales del cloud: %s.", exc)
@@ -335,7 +350,7 @@ class CloudApiClient:
             logger.warning(
                 "Error HTTP %s al reenviar lote al cloud: %s.",
                 exc.response.status_code,
-                exc,
+                _safe_response_message(exc.response),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Error inesperado al reenviar lote al cloud: %s.", exc)
