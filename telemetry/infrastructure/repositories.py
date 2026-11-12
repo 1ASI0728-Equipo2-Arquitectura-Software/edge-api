@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from telemetry.domain.model import AgronomicThreshold, SensorReadingValue, TelemetryRecord
+from telemetry.domain.time import normalize_utc, to_utc_iso, utc_now
 from telemetry.domain.services import IAgronomicThresholdRepository, ITelemetryRepository
 from telemetry.infrastructure.database import (
     AgronomicThresholdModel,
@@ -57,7 +58,7 @@ class TelemetryRepository(ITelemetryRepository):
         with db.atomic():
             telemetry_model = TelemetryRecordModel.create(
                 device_id=record.device_id,
-                recorded_at=record.recorded_at,
+                recorded_at=normalize_utc(record.recorded_at),
             )
 
             reading_rows = [
@@ -66,7 +67,7 @@ class TelemetryRepository(ITelemetryRepository):
                     "variable": reading.variable,
                     "value": reading.value,
                     "unit": reading.unit,
-                    "timestamp": reading.timestamp,
+                    "timestamp": normalize_utc(reading.timestamp),
                 }
                 for reading in record.readings
             ]
@@ -165,13 +166,13 @@ class CloudOutboxRepository:
         payload = json.dumps(
             {
                 "device_id": record.device_id,
-                "recorded_at": record.recorded_at.isoformat(),
+                "recorded_at": to_utc_iso(record.recorded_at),
                 "readings": [
                     {
                         "variable": value.variable,
                         "value": value.value,
                         "unit": value.unit,
-                        "timestamp": value.timestamp.isoformat(),
+                        "timestamp": to_utc_iso(value.timestamp),
                     }
                     for value in record.readings
                 ],
@@ -182,7 +183,7 @@ class CloudOutboxRepository:
 
     @staticmethod
     def due(limit: int = 10) -> list[CloudOutboxModel]:
-        now = datetime.now(timezone.utc)
+        now = utc_now()
         return list(
             CloudOutboxModel.select()
             .where(
@@ -195,7 +196,7 @@ class CloudOutboxRepository:
 
     @staticmethod
     def mark_sent(item: CloudOutboxModel) -> None:
-        item.sent_at = datetime.now(timezone.utc)
+        item.sent_at = utc_now()
         item.last_error = None
         item.save(only=[CloudOutboxModel.sent_at, CloudOutboxModel.last_error])
 
@@ -203,7 +204,7 @@ class CloudOutboxRepository:
     def mark_failed(item: CloudOutboxModel, error: str) -> None:
         item.attempts += 1
         delay_seconds = min(300, 2 ** min(item.attempts, 8))
-        item.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        item.next_attempt_at = utc_now() + timedelta(seconds=delay_seconds)
         item.last_error = error[:1000]
         item.save(
             only=[
@@ -218,13 +219,13 @@ class CloudOutboxRepository:
         data = json.loads(item.payload)
         return TelemetryRecord(
             device_id=data["device_id"],
-            recorded_at=datetime.fromisoformat(data["recorded_at"]),
+            recorded_at=normalize_utc(datetime.fromisoformat(data["recorded_at"])),
             readings=[
                 SensorReadingValue(
                     variable=value["variable"],
                     value=float(value["value"]),
                     unit=value["unit"],
-                    timestamp=datetime.fromisoformat(value["timestamp"]),
+                    timestamp=normalize_utc(datetime.fromisoformat(value["timestamp"])),
                 )
                 for value in data["readings"]
             ],

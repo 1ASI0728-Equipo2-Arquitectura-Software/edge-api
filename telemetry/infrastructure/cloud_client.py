@@ -57,6 +57,7 @@ from typing import Optional
 import requests
 
 from telemetry.domain.model import AgronomicThreshold, TelemetryRecord
+from telemetry.domain.time import to_utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -282,7 +283,7 @@ class CloudApiClient:
             return False
 
         url = f"{_BASE_URL}/api/v1/edge-gateways/{_EDGE_MAC}/sensor-readings"
-        timestamp = record.recorded_at.isoformat()
+        timestamp = to_utc_iso(record.recorded_at)
 
         payload = {
             "devices": [
@@ -291,7 +292,7 @@ class CloudApiClient:
                     "readings": [
                         {
                             "sensorType": _to_sensor_type(r.variable),
-                            "measuredAt": r.timestamp.isoformat(),
+                            "measuredAt": to_utc_iso(r.timestamp),
                             "value": r.value,
                         }
                         for r in record.readings

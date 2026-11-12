@@ -9,10 +9,11 @@ agronómicos, persistirlas localmente y reenviarlas al cloud.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from telemetry.domain.model import SensorReadingValue, TelemetryRecord
+from telemetry.domain.time import normalize_utc, parse_timestamp, utc_now
 from telemetry.domain.services import (
     IAgronomicThresholdRepository,
     ITelemetryRepository,
@@ -73,12 +74,13 @@ class TelemetryApplicationService:
         if not readings_data:
             raise ValueError("El lote de lecturas no puede estar vacío.")
 
-        readings = self._parse_readings(readings_data)
+        received_at = utc_now()
+        readings = self._parse_readings(readings_data, received_at)
 
         record = TelemetryRecord(
             device_id=device_id,
             readings=readings,
-            recorded_at=datetime.now(timezone.utc),
+            recorded_at=received_at,
         )
 
         alert_flags = self._domain_service.evaluate_alerts(record)
@@ -98,6 +100,7 @@ class TelemetryApplicationService:
     @staticmethod
     def _parse_readings(
         readings_data: list[dict[str, Any]],
+        received_at: datetime | None = None,
     ) -> list[SensorReadingValue]:
         """
         Convierte dicts raw del request en SensorReadingValue.
@@ -109,10 +112,11 @@ class TelemetryApplicationService:
             Lista de SensorReadingValue listos para el TelemetryRecord.
 
         Raises:
-            ValueError: Si algún dict tiene keys faltantes o timestamp inválido.
+            ValueError: Si algún dict tiene keys faltantes o valores inválidos.
         """
         required_keys = {"variable", "value", "unit", "timestamp"}
         readings = []
+        received_at = normalize_utc(received_at or utc_now())
 
         for i, item in enumerate(readings_data):
             missing = required_keys - item.keys()
@@ -121,15 +125,18 @@ class TelemetryApplicationService:
                     f"Lectura [{i}] le faltan los campos: {missing}."
                 )
 
+            raw_timestamp = item["timestamp"]
             try:
-                timestamp = datetime.fromisoformat(item["timestamp"])
+                timestamp = parse_timestamp(raw_timestamp, received_at)
+                if not isinstance(raw_timestamp, str):
+                    raise ValueError
+                datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
             except (ValueError, TypeError):
                 logger.warning(
                     "Lectura [%d] tiene timestamp inválido '%s' — usando hora de recepción.",
-                    i,
-                    item["timestamp"],
+                    i, raw_timestamp,
                 )
-                timestamp = datetime.now(timezone.utc)
+                timestamp = received_at
 
             readings.append(
                 SensorReadingValue(
