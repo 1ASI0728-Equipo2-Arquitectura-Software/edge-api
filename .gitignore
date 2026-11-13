@@ -14,6 +14,7 @@ ENV/
 *.swp
 *.swo
 *~
+.vscode
 
 # Flask
 instance/

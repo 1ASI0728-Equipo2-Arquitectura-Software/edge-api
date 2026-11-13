@@ -9,17 +9,18 @@ agronómicos, persistirlas localmente y reenviarlas al cloud.
 """
 
 import logging
-import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from telemetry.domain.model import SensorReadingValue, TelemetryRecord
+from telemetry.domain.time import normalize_utc, parse_timestamp, utc_now
 from telemetry.domain.services import (
     IAgronomicThresholdRepository,
     ITelemetryRepository,
     TelemetryDomainService,
 )
-from telemetry.infrastructure.cloud_client import CloudApiClient
+from telemetry.infrastructure.repositories import CloudOutboxRepository
+from iam.infrastructure.repositories import DeviceRepository
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +38,11 @@ class TelemetryApplicationService:
         self,
         telemetry_repository: ITelemetryRepository,
         threshold_repository: IAgronomicThresholdRepository,
+        device_repository: DeviceRepository | None = None,
     ) -> None:
         self._telemetry_repo = telemetry_repository
         self._domain_service = TelemetryDomainService(threshold_repository)
+        self._device_repository = device_repository or DeviceRepository()
 
     def record_telemetry(
         self,
@@ -53,7 +56,7 @@ class TelemetryApplicationService:
         1. Construye TelemetryRecord desde los datos raw del request.
         2. Evalúa alertas contra umbrales agronómicos (domain service).
         3. Persiste el record localmente (SQLite).
-        4. Reenvía el lote al Web Service central (fire-and-forget).
+        4. Encola el lote para reintento durable hacia el Web Service central.
         5. Retorna (record_id, alert_flags) al caller (Blueprint).
 
         Args:
@@ -74,17 +77,25 @@ class TelemetryApplicationService:
         if not readings_data:
             raise ValueError("El lote de lecturas no puede estar vacío.")
 
-        readings = self._parse_readings(readings_data)
+        received_at = utc_now()
+        readings = self._parse_readings(readings_data, received_at)
+        device = self._device_repository.find_by_device_id(device_id)
+        if device is None or device.owner_user_id <= 0:
+            raise ValueError("El dispositivo no tiene un propietario válido en el registry.")
+
+
 
         record = TelemetryRecord(
             device_id=device_id,
             readings=readings,
-            recorded_at=datetime.now(timezone.utc),
+            owner_user_id=device.owner_user_id,
+            recorded_at=received_at,
         )
 
         alert_flags = self._domain_service.evaluate_alerts(record)
 
         record_id = self._telemetry_repo.save(record)
+        CloudOutboxRepository.enqueue(record)
 
         logger.info(
             "Telemetría registrada: record_id=%d device_id='%s' alertas=%s.",
@@ -93,19 +104,12 @@ class TelemetryApplicationService:
             {k: v for k, v in alert_flags.items() if v},
         )
 
-        # Fire-and-forget real: lanza el reenvío en un hilo de fondo para
-        # que Flask responda 201 al ESP32 de inmediato, sin esperar al cloud.
-        threading.Thread(
-            target=CloudApiClient.post_telemetry_batch,
-            args=(record,),
-            daemon=True,
-        ).start()
-
         return record_id, alert_flags
 
     @staticmethod
     def _parse_readings(
         readings_data: list[dict[str, Any]],
+        received_at: datetime | None = None,
     ) -> list[SensorReadingValue]:
         """
         Convierte dicts raw del request en SensorReadingValue.
@@ -117,10 +121,11 @@ class TelemetryApplicationService:
             Lista de SensorReadingValue listos para el TelemetryRecord.
 
         Raises:
-            ValueError: Si algún dict tiene keys faltantes o timestamp inválido.
+            ValueError: Si algún dict tiene keys faltantes o valores inválidos.
         """
         required_keys = {"variable", "value", "unit", "timestamp"}
         readings = []
+        received_at = normalize_utc(received_at or utc_now())
 
         for i, item in enumerate(readings_data):
             missing = required_keys - item.keys()
@@ -129,15 +134,18 @@ class TelemetryApplicationService:
                     f"Lectura [{i}] le faltan los campos: {missing}."
                 )
 
+            raw_timestamp = item["timestamp"]
             try:
-                timestamp = datetime.fromisoformat(item["timestamp"])
+                timestamp = parse_timestamp(raw_timestamp, received_at)
+                if not isinstance(raw_timestamp, str):
+                    raise ValueError
+                datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
             except (ValueError, TypeError):
                 logger.warning(
                     "Lectura [%d] tiene timestamp inválido '%s' — usando hora de recepción.",
-                    i,
-                    item["timestamp"],
+                    i, raw_timestamp,
                 )
-                timestamp = datetime.now(timezone.utc)
+                timestamp = received_at
 
             readings.append(
                 SensorReadingValue(

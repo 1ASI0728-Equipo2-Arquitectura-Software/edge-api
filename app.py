@@ -6,9 +6,8 @@ y ejecuta el bootstrap al iniciar la aplicación.
 
 Bootstrap (ejecutado en create_app, antes de aceptar requests):
   1. Inicializa la base de datos SQLite y crea las tablas si no existen.
-  2. Registra el Edge Device y el IoT Device en el Web Service central.
-  3. Siembra el dispositivo de prueba (smart-palm-001) si no está registrado.
-  4. Sincroniza umbrales agronómicos desde el Web Service central.
+  2. Sincroniza el registro de dispositivos que el administrador ya provisionó.
+  3. Sincroniza umbrales agronómicos desde el Web Service central.
 
 Variables de entorno:
   DATABASE_PATH   — Ruta al archivo SQLite (default: edge_data.db)
@@ -41,10 +40,12 @@ from telemetry.application.threshold_sync import ThresholdSyncService
 from telemetry.infrastructure.cloud_client import CloudApiClient
 from telemetry.infrastructure.database import (
     AgronomicThresholdModel,
+    CloudOutboxModel,
     SensorReadingModel,
     TelemetryRecordModel,
 )
 from telemetry.infrastructure.repositories import AgronomicThresholdRepository
+from telemetry.application.outbox import start_cloud_outbox_worker
 from telemetry.interfaces.routes import telemetry_api
 
 logging.basicConfig(
@@ -57,7 +58,6 @@ logger = logging.getLogger(__name__)
 # Configuración
 # ---------------------------------------------------------------------------
 _DATABASE_PATH = os.getenv("DATABASE_PATH", "edge_data.db")
-_TEST_DEVICE_ID = "smart-palm-001"
 
 # ---------------------------------------------------------------------------
 # Modelos que init_db debe registrar (orden respeta FKs)
@@ -67,6 +67,7 @@ _DB_MODELS = [
     TelemetryRecordModel,
     SensorReadingModel,
     AgronomicThresholdModel,
+    CloudOutboxModel,
 ]
 
 # ---------------------------------------------------------------------------
@@ -98,37 +99,27 @@ def create_app() -> Flask:
 
     # 1. Inicializar base de datos
     init_db(_DATABASE_PATH, _DB_MODELS)
+    start_cloud_outbox_worker()
 
     # 1.5 Anunciar este Edge API por mDNS (_smartpalm._tcp) para que el
     #     Edge Node (ESP32) descubra la IP de esta máquina en cualquier red.
     #     Falla silenciosa si zeroconf no está disponible.
     register_mdns_service(port=5001)
 
-    # 2. Registrar dispositivos en el cloud (idempotente: 409 = ya registrado)
-    edge_registered = CloudApiClient.register_edge_device()
-    if edge_registered:
-        CloudApiClient.register_iot_device()
-    else:
-        logger.warning(
-            "No se pudo registrar el Edge Device en el cloud — "
-            "IoT Device y umbrales no se sincronizarán."
-        )
-
-    # 2.5 Sincronizar lista de IoT devices autorizados desde el Cloud al IAM local
-    mac_list = CloudApiClient.fetch_registry()
-    new_count = _auth_service.sync_from_registry(mac_list)
+    # 2. Sincronizar lista de IoT devices autorizados desde el Cloud al IAM local.
+    # El alta se realiza exclusivamente desde el panel/API de administración.
+    registry = CloudApiClient.fetch_registry()
+    new_count = _auth_service.sync_from_registry(registry)
     if new_count > 0:
         logger.info("Registry sincronizado: %d device(s) nuevo(s) añadidos al IAM.", new_count)
-    elif mac_list:
+    elif registry:
         logger.info("Registry sincronizado: todos los devices ya estaban en el IAM local.")
     else:
         logger.info("Registry vacío o no disponible — IAM local sin cambios.")
 
-    # 3. Sembrar dispositivo de prueba en IAM local
-    _auth_service.seed_test_device()
-
-    # 4. Sincronizar umbrales desde el cloud
-    synced = _sync_service.sync(_TEST_DEVICE_ID)
+    # 3. Sincronizar umbrales desde el cloud para el IoT provisionado.
+    iot_device_id = os.getenv("IOT_MAC", "").strip()
+    synced = _sync_service.sync(iot_device_id) if iot_device_id else 0
     if synced == 0:
         logger.info(
             "Sin umbrales del cloud — se usarán valores agronómicos por defecto."

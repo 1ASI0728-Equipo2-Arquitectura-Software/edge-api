@@ -50,11 +50,14 @@ Configuración (variables de entorno):
 
 import logging
 import os
+import time
+from urllib.parse import quote
 from typing import Optional
 
 import requests
 
 from telemetry.domain.model import AgronomicThreshold, TelemetryRecord
+from telemetry.domain.time import to_utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +65,68 @@ _BASE_URL       = os.getenv("CLOUD_BASE_URL", "http://localhost:5000")
 _EDGE_MAC       = os.getenv("EDGE_MAC", "")
 _IOT_MAC        = os.getenv("IOT_MAC", "")
 _API_KEY        = os.getenv("CLOUD_API_KEY", "")
+_GATEWAY_KEY    = os.getenv("CLOUD_GATEWAY_KEY", "")
 _TIMEOUT        = int(os.getenv("CLOUD_TIMEOUT", "5"))
-_ZONE_ID        = int(os.getenv("MONITORING_ZONE_ID", "1"))
 _ADMIN_USERNAME = os.getenv("CLOUD_ADMIN_USERNAME", "admin")
 _ADMIN_PASSWORD = os.getenv("CLOUD_ADMIN_PASSWORD", "admin")
+
+# ─── Sesión JWT con el Web Service ──────────────────────────────────────────
+# El backend protege /edge-gateways, /devices/{mac}/thresholds y el registry
+# con [Authorize]. El Edge API se autentica una vez con las credenciales de
+# administrador y reutiliza el token hasta que esté por vencer.
+# ───────────────────────────────────────────────────────────────────────────
+_TOKEN_TTL_SECONDS = 50 * 60  # se refresca antes de que el JWT expire (~1h)
+_token_cache: dict = {"token": None, "expires_at": 0.0}
+
+
+def _safe_response_message(response: requests.Response) -> str:
+    """Extracts a bounded server message without exposing credentials or tokens."""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            message = payload.get("message") or payload.get("title") or payload.get("detail")
+            if message:
+                return str(message)[:500]
+    except ValueError:
+        pass
+
+    text = response.text.strip()
+    return text[:500] if text else "empty response body"
+
+
+def _get_auth_token() -> Optional[str]:
+    """Obtiene (y cachea) un JWT autenticándose como administrador en el cloud."""
+    if _token_cache["token"] and time.time() < _token_cache["expires_at"]:
+        return _token_cache["token"]
+
+    if not _ADMIN_USERNAME or not _ADMIN_PASSWORD:
+        logger.debug("CLOUD_ADMIN_USERNAME/PASSWORD no configurados — sin token de cloud.")
+        return None
+
+    url = f"{_BASE_URL}/api/v1/authentication/sign-in"
+    try:
+        response = requests.post(
+            url,
+            json={"username": _ADMIN_USERNAME, "password": _ADMIN_PASSWORD},
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=_TIMEOUT,
+        )
+        response.raise_for_status()
+        token = response.json().get("token")
+        if not token:
+            logger.warning("Sign-in al cloud no devolvió token.")
+            return None
+        _token_cache["token"] = token
+        _token_cache["expires_at"] = time.time() + _TOKEN_TTL_SECONDS
+        logger.info("Autenticado en el cloud como '%s'.", _ADMIN_USERNAME)
+        return token
+    except requests.exceptions.HTTPError as exc:
+        logger.warning(
+            "Error HTTP %s al autenticarse en el cloud: %s.", exc.response.status_code, exc
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("No se pudo autenticar en el cloud: %s.", exc)
+    return None
 
 # ─── Mapeo bidireccional entre nombres de variable del Edge API ─────────────
 # y SensorType del Web Service.
@@ -104,11 +165,16 @@ class CloudApiClient:
     """
 
     @staticmethod
-    def _headers() -> dict:
+    def _headers(include_gateway_key: bool = False) -> dict:
         """Construye los headers HTTP comunes para todas las peticiones."""
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if _API_KEY:
             headers["X-Api-Key"] = _API_KEY
+        if include_gateway_key and _GATEWAY_KEY:
+            headers["X-Gateway-Key"] = _GATEWAY_KEY
+        token = _get_auth_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         return headers
 
     @staticmethod
@@ -200,7 +266,7 @@ class CloudApiClient:
                 logger.warning(
                     "Error HTTP %s al obtener umbrales del cloud: %s.",
                     exc.response.status_code,
-                    exc,
+                    _safe_response_message(exc.response),
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Error inesperado al obtener umbrales del cloud: %s.", exc)
@@ -232,7 +298,7 @@ class CloudApiClient:
             return False
 
         url = f"{_BASE_URL}/api/v1/edge-gateways/{_EDGE_MAC}/sensor-readings"
-        timestamp = record.recorded_at.isoformat()
+        timestamp = to_utc_iso(record.recorded_at)
 
         payload = {
             "devices": [
@@ -241,7 +307,7 @@ class CloudApiClient:
                     "readings": [
                         {
                             "sensorType": _to_sensor_type(r.variable),
-                            "measuredAt": r.timestamp.isoformat(),
+                            "measuredAt": to_utc_iso(r.timestamp),
                             "value": r.value,
                         }
                         for r in record.readings
@@ -255,7 +321,7 @@ class CloudApiClient:
             response = requests.post(
                 url,
                 json=payload,
-                headers=CloudApiClient._headers(),
+                headers=CloudApiClient._headers(include_gateway_key=True),
                 timeout=_TIMEOUT,
             )
             response.raise_for_status()
@@ -284,7 +350,7 @@ class CloudApiClient:
             logger.warning(
                 "Error HTTP %s al reenviar lote al cloud: %s.",
                 exc.response.status_code,
-                exc,
+                _safe_response_message(exc.response),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Error inesperado al reenviar lote al cloud: %s.", exc)
@@ -292,7 +358,24 @@ class CloudApiClient:
         return False
 
     @staticmethod
-    def fetch_registry() -> list[str]:
+    def mark_device_provisioned(device_id: str, provisioned: bool) -> bool:
+        """Replica en DeviceService el estado de provisión local del Edge API."""
+        action = "provision" if provisioned else "revoke"
+        url = f"{_BASE_URL}/api/v1/admin/iot-devices/{quote(device_id, safe='')}/{action}"
+        try:
+            response = requests.post(url, headers=CloudApiClient._headers(), timeout=_TIMEOUT)
+            response.raise_for_status()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "No se pudo sincronizar provisión de '%s' con el cloud: %s.",
+                device_id,
+                exc,
+            )
+            return False
+
+    @staticmethod
+    def fetch_registry() -> list[dict]:
         """
         Obtiene la lista de IoT Devices autorizados para este Edge desde el Cloud.
 
@@ -318,11 +401,11 @@ class CloudApiClient:
             )
             response.raise_for_status()
             data = response.json()
-            mac_list = [entry["iotDeviceMac"] for entry in data.get("registry", [])]
+            registry = [entry for entry in data.get("registry", []) if entry.get("iotDeviceMac")]
             logger.info(
-                "Registry obtenido del cloud: %d IoT device(s) autorizados.", len(mac_list)
+                "Registry obtenido del cloud: %d IoT device(s) autorizados.", len(registry)
             )
-            return mac_list
+            return registry
 
         except requests.exceptions.ConnectionError:
             logger.warning("Cloud no disponible al obtener registry (ConnectionError).")
@@ -343,113 +426,3 @@ class CloudApiClient:
 
         return []
 
-    @staticmethod
-    def register_edge_device() -> bool:
-        """
-        Registra el Edge Device en el Cloud si aún no existe.
-
-        Hace POST a /api/v1/edge-gateways con la MAC y monitoringZoneId configurados.
-        Un 409 Conflict indica que el device ya estaba registrado — se trata
-        como éxito para que el bootstrap sea idempotente en reinicios.
-
-        Returns:
-            True si el dispositivo quedó registrado (201) o ya existía (409).
-            False si ocurrió un error de red o de autenticación.
-        """
-        if not _EDGE_MAC:
-            logger.warning("EDGE_MAC no configurado — registro del Edge Device omitido.")
-            return False
-
-        url = f"{_BASE_URL}/api/v1/edge-gateways"
-        payload = {
-            "edgeMac":          _EDGE_MAC,
-            "monitoringZoneId": _ZONE_ID,
-            "username":         _ADMIN_USERNAME,
-            "password":         _ADMIN_PASSWORD,
-        }
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                headers=CloudApiClient._headers(),
-                timeout=_TIMEOUT,
-            )
-            if response.status_code == 409:
-                logger.info("Edge Device '%s' ya estaba registrado en el cloud (409).", _EDGE_MAC)
-                return True
-            response.raise_for_status()
-            logger.info("Edge Device '%s' registrado en el cloud (201).", _EDGE_MAC)
-            return True
-
-        except requests.exceptions.ConnectionError:
-            logger.warning("Cloud no disponible al registrar Edge Device (ConnectionError).")
-        except requests.exceptions.Timeout:
-            logger.warning("Timeout al registrar Edge Device en el cloud (>%ds).", _TIMEOUT)
-        except requests.exceptions.HTTPError as exc:
-            logger.warning(
-                "Error HTTP %s al registrar Edge Device: %s.", exc.response.status_code, exc
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Error inesperado al registrar Edge Device: %s.", exc)
-
-        return False
-
-    @staticmethod
-    def register_iot_device() -> bool:
-        """
-        Registra el IoT Device en el Cloud asociándolo al Edge Device.
-
-        Hace POST a /api/v1/edge-gateways/{edgeMac}/iot-devices con la MAC del D1.
-        Requiere que el Edge Device ya esté registrado. Un 409 indica que
-        el IoT Device ya existía — se trata como éxito (idempotente).
-        El backend publica IotDeviceRegisteredEvent al registrar por primera
-        vez, lo que siembra los umbrales agronómicos por defecto.
-
-        Returns:
-            True si el dispositivo quedó registrado (201) o ya existía (409).
-            False si ocurrió un error de red, autenticación o el Edge no existe.
-        """
-        if not _EDGE_MAC or not _IOT_MAC:
-            logger.warning(
-                "EDGE_MAC o IOT_MAC no configurados — registro del IoT Device omitido."
-            )
-            return False
-
-        url = f"{_BASE_URL}/api/v1/edge-gateways/{_EDGE_MAC}/iot-devices"
-        payload = {
-            "iotMac":   _IOT_MAC,
-            "username": _ADMIN_USERNAME,
-            "password": _ADMIN_PASSWORD,
-        }
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                headers=CloudApiClient._headers(),
-                timeout=_TIMEOUT,
-            )
-            if response.status_code == 409:
-                logger.info(
-                    "IoT Device '%s' ya estaba registrado en el cloud (409).", _IOT_MAC
-                )
-                return True
-            response.raise_for_status()
-            logger.info(
-                "IoT Device '%s' registrado en el cloud y asociado a Edge '%s' (201).",
-                _IOT_MAC,
-                _EDGE_MAC,
-            )
-            return True
-
-        except requests.exceptions.ConnectionError:
-            logger.warning("Cloud no disponible al registrar IoT Device (ConnectionError).")
-        except requests.exceptions.Timeout:
-            logger.warning("Timeout al registrar IoT Device en el cloud (>%ds).", _TIMEOUT)
-        except requests.exceptions.HTTPError as exc:
-            logger.warning(
-                "Error HTTP %s al registrar IoT Device: %s.", exc.response.status_code, exc
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Error inesperado al registrar IoT Device: %s.", exc)
-
-        return False
